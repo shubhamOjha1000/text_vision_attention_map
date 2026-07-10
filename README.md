@@ -1,8 +1,14 @@
 # text_vision_attention_map
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/shubhamOjha1000/text_vision_attention_map/blob/main/colab_demo.ipynb)
+
 Extract the **text → vision attention map** from PaliGemma — the same decoder
 self-attention that SparseVLM uses to build its priority matrix `P` — with
 **text tokens in the rows and visual tokens in the columns**.
+
+**Quick start:** click the *Open in Colab* badge above — it clones this repo,
+loads PaliGemma from the Hub, takes any image URL + question, and plots the
+decoder attention at layers 0 and 1 (rows = text, columns = vision).
 
 This folder is **not** about sparsification. No raters, no pruning. **Every text
 token is kept in the rows.** We only read the attention map out and hand it back.

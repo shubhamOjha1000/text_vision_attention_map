@@ -6,19 +6,41 @@ from typing import Tuple
 import os
 import torch
 
-def load_hf_model(model_path: str, device: str) :
+def load_hf_model(model_path: str = "google/paligemma-3b-pt-224", device: str = "cpu"):
+    """
+    Load PaliGemma (weights + tokenizer + config) into the custom implementation.
 
+    `model_path` can be either:
+      - a HuggingFace Hub repo id (e.g. "google/paligemma-3b-pt-224") -> the files
+        are downloaded from the Hub automatically, or
+      - a path to a local directory that already contains config.json, the
+        tokenizer files and the *.safetensors weights.
+
+    Note: PaliGemma is a gated model on the Hub. To download it you must have
+    accepted the license and be authenticated, e.g. `huggingface-cli login`
+    or by setting the HF_TOKEN environment variable.
+    """
     # Import here to avoid circular dependency
     from modeling_gemma import PaliGemmaForConditionalGeneration, PaliGemmaConfig
 
+    # Resolve the model files: local directory, or download from the HF Hub.
+    if os.path.isdir(model_path):
+        local_dir = model_path
+    else:
+        from huggingface_hub import snapshot_download
+        print(f"Downloading '{model_path}' from the HuggingFace Hub ...")
+        local_dir = snapshot_download(
+            repo_id=model_path,
+            allow_patterns=["*.safetensors", "*.json", "*.model", "tokenizer*", "*.txt"],
+        )
+
     # Load the tokenizer
-    path = '/kaggle/input/hf-google-paligemma-3b-pt-224'
-    tokenizer = AutoTokenizer.from_pretrained(path, padding_side="right")
+    tokenizer = AutoTokenizer.from_pretrained(local_dir, padding_side="right")
     assert tokenizer.padding_side == "right"
     print("Loaded Tokenizer")
 
     # Find all the *.safetensors files
-    safetensors_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+    safetensors_files = glob.glob(os.path.join(local_dir, "*.safetensors"))
 
     # ... and load them one by one in the tensors dictionary
     tensors = {}
@@ -28,7 +50,7 @@ def load_hf_model(model_path: str, device: str) :
                 tensors[key] = f.get_tensor(key)
 
     # Load the model's config
-    with open(os.path.join(path, "config.json"), "r") as f:
+    with open(os.path.join(local_dir, "config.json"), "r") as f:
         model_config_file = json.load(f)
         config = PaliGemmaConfig(**model_config_file)
 

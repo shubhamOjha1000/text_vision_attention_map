@@ -53,7 +53,8 @@ def maybe_plot(P: torch.Tensor, text_tokens, layer: int, save_path: str):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model_path", required=True, type=str)
+    ap.add_argument("--model_path", default="google/paligemma-3b-pt-224", type=str,
+                    help="HF Hub repo id (auto-downloaded) or a local weights dir")
     ap.add_argument("--image", required=True, type=str)
     ap.add_argument("--prompt", required=True, type=str)
     ap.add_argument("--layer", default=0, type=int,

@@ -29,23 +29,39 @@ that is not padding.
 
 | file | purpose |
 |------|---------|
-| `attention_extractor.py` | `AttentionMapExtractor` — hooks + slicing; returns per-layer maps `[L_t, L_v]` and per-head `[H, L_t, L_v]`. |
-| `run_extract.py` | CLI: load model, extract, print shapes, optionally save `maps.pt` + a heatmap PNG. |
+| `get_attention_map.py` | **Main entry.** Hooks only the decoder layer(s) you pick; returns head-averaged `[L_t, L_v]` and per-head `[H, L_t, L_v]` maps. |
+| `attention_extractor.py` / `run_extract.py` | Library + CLI variants that capture **all** layers at once. |
+| `inference.py` | Plain PaliGemma generation loop (sanity-check the model answers). |
+| `modeling_gemma.py`, `modeling_siglip.py`, `processing_paligemma.py`, `utils.py` | Self-contained PaliGemma (SigLIP + Gemma) implementation, SparseVLM removed. |
 
-The PaliGemma model itself (SigLIP + Gemma) is **reused as-is** from the sibling
-`../SparseVLM_code/` folder (imported at runtime), so the map is identical to
-what the paper's code sees. That folder must sit next to this one.
+The folder is self-contained — no dependency on any sibling folder.
+
+## Weights
+
+Weights load **straight from the HuggingFace Hub** by default
+(`google/paligemma-3b-pt-224`); no manual download needed. You can also pass a
+local directory (containing `config.json`, tokenizer files and `*.safetensors`)
+to `--model_path`.
+
+PaliGemma is a **gated** model, so accept its license on the Hub once and
+authenticate before first download:
+
+```bash
+huggingface-cli login          # or: export HF_TOKEN=hf_xxx
+```
 
 ## Run
 
 ```bash
-python run_extract.py \
-    --model_path /path/to/paligemma-3b-pt-224 \
-    --image      /path/to/car.png \
-    --prompt     "Color of car is Black right?" \
-    --layer 0 \
+# --model_path defaults to google/paligemma-3b-pt-224 (auto-downloaded)
+python get_attention_map.py \
+    --image   /path/to/car.png \
+    --prompt  "Color of car is Black right?" \
+    --layers  0 \
     --save_dir ./out
 ```
+
+Pick any decoder layer(s): `--layers 0 5 17`.
 
 ## Use as a library
 

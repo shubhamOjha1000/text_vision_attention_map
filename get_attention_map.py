@@ -174,7 +174,8 @@ def _maybe_plot(P, text_tokens, layer, path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model_path", required=True)
+    ap.add_argument("--model_path", default="google/paligemma-3b-pt-224",
+                    help="HF Hub repo id (auto-downloaded) or a local weights dir")
     ap.add_argument("--image", required=True)
     ap.add_argument("--prompt", required=True)
     ap.add_argument("--layers", nargs="+", type=int, default=[0],

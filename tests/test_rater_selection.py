@@ -34,6 +34,7 @@ from rater_selection import (  # noqa: E402
     content_text_mask,
     default_band,
     is_punctuation_token,
+    is_stopword_token,
     is_structural_token,
     is_suppressed_token,
     question_span_mask,
@@ -175,7 +176,8 @@ ALL_CHECKS = [
 # --------------------------------------------------------------------------- #
 # Synthetic case (no model) -> run every invariant check
 # --------------------------------------------------------------------------- #
-TOKENS = ["<bos>", "▁a", "▁cat", "▁sits", "▁on", "Ċ"]  # Ċ = byte-level newline
+# content words are all non-stopwords (red, cat, sits, mat); structural at 0/5
+TOKENS = ["<bos>", "▁red", "▁cat", "▁sits", "▁mat", "Ċ"]  # Ċ = byte-level newline
 CONTENT_IDX = [1, 2, 3, 4]
 GROUNDED = {2, 3}
 
@@ -224,6 +226,22 @@ def test_punctuation_is_suppressed_from_content():
     toks = ["Ġcat", "?", "Ġsits", ":", "Ġmat"]
     keep = content_text_mask(toks)
     assert keep.tolist() == [True, False, True, False, True]
+
+
+def test_stopword_detection():
+    for t in ("the", "Ġthe", "▁a", "an", "is", "Ġare", "in", "on", "of", "and"):
+        assert is_stopword_token(t), t
+    for t in ("cat", "Ġcats", "how", "Ġmany", "image", "2", "red"):  # kept content
+        assert not is_stopword_token(t), t
+
+
+def test_stopwords_suppressed_and_disable_option():
+    toks = ["Ġthe", "Ġcat", "Ġis", "Ġred"]           # the/is are stopwords
+    keep = content_text_mask(toks)
+    assert keep.tolist() == [False, True, False, True]  # cat, red kept
+    # opt-out keeps everything
+    keep_all = content_text_mask(toks, stopwords=frozenset())
+    assert keep_all.all()
 
 
 def test_content_mask_suppresses_structural():

@@ -78,9 +78,37 @@ def is_punctuation_token(tok: Optional[str]) -> bool:
     return not any(ch.isalnum() for ch in c)
 
 
-def is_suppressed_token(tok: Optional[str]) -> bool:
-    """A token to drop before rating: structural/special/whitespace OR punctuation."""
-    return is_structural_token(tok) or is_punctuation_token(tok)
+# function words that carry no visual grounding (articles, prepositions, copulas,
+# conjunctions, determiners/pronouns). Kept OUT on purpose: question words
+# (how/what/which/where/...) and quantifiers/numbers (many/few/two/...), which
+# carry query intent and can matter (e.g. counting).
+DEFAULT_STOPWORDS = frozenset({
+    "a", "an", "the",
+    "is", "am", "are", "was", "were", "be", "been", "being",
+    "do", "does", "did", "has", "have", "had",
+    "of", "to", "in", "on", "at", "by", "for", "with", "from",
+    "into", "onto", "as", "about", "over", "under",
+    "and", "or", "but", "nor", "so", "yet",
+    "it", "its", "this", "that", "these", "those", "there", "here",
+    "'s", "s",
+})
+
+
+def is_stopword_token(tok: Optional[str],
+                      stopwords: frozenset = DEFAULT_STOPWORDS) -> bool:
+    """True if `tok` (de-tokenised, lowercased) is a non-grounded function word."""
+    if tok is None:
+        return False
+    return _clean_token(tok).lower() in stopwords
+
+
+def is_suppressed_token(tok: Optional[str],
+                        stopwords: frozenset = DEFAULT_STOPWORDS) -> bool:
+    """A token to drop before rating: structural/special/whitespace, punctuation,
+    or a non-grounded function word (stopword)."""
+    return (is_structural_token(tok)
+            or is_punctuation_token(tok)
+            or is_stopword_token(tok, stopwords))
 
 
 def _detok_piece(tok: Optional[str]) -> str:
@@ -122,16 +150,18 @@ def question_span_mask(text_tokens: Sequence[str], question: str) -> torch.Tenso
 
 
 def content_text_mask(text_tokens: Sequence[str],
-                      tokenizer=None) -> torch.Tensor:
+                      tokenizer=None,
+                      stopwords: frozenset = DEFAULT_STOPWORDS) -> torch.Tensor:
     """
     bool[L_t] over the text rows: True = real content token to keep, False =
-    structural/special token to suppress. Uses token strings, and additionally
-    `tokenizer.all_special_ids` when a tokenizer is given.
+    suppressed (structural/special/whitespace, punctuation, or a stopword).
+    Uses token strings, plus `tokenizer.all_special_ids` when a tokenizer is
+    given. Pass `stopwords=frozenset()` to disable function-word removal.
     """
     L_t = len(text_tokens)
     keep = torch.ones(L_t, dtype=torch.bool)
     for i, tok in enumerate(text_tokens):
-        if is_suppressed_token(tok):          # structural/special/whitespace OR punctuation
+        if is_suppressed_token(tok, stopwords):   # structural / punctuation / stopword
             keep[i] = False
     if tokenizer is not None:
         try:

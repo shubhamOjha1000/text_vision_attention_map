@@ -186,9 +186,10 @@ def make_smolvlm_output(model_id: Optional[str] = None,
 
         # ---- build one (image, prompt) input via the chat template ----
         image = _load_demo_image()
+        question = "How many cats are in the image?"
         messages = [{"role": "user", "content": [
             {"type": "image"},
-            {"type": "text", "text": "How many cats are in the image?"}]}]
+            {"type": "text", "text": question}]}]
         prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
         inp = processor(text=prompt, images=[image], return_tensors="pt").to(device)
         assert "input_ids" in inp, "processor returned no input_ids"
@@ -233,7 +234,7 @@ def make_smolvlm_output(model_id: Optional[str] = None,
         text_mask = (input_ids != img_id) & (input_ids != pad_id)
 
         out = ProbeOutput(input_ids, image_mask, text_mask, raw_scores, post_softmax,
-                          expected_num_image_tokens=None, name="smolvlm")
+                          expected_num_image_tokens=None, name="smolvlm", question=question)
     except Exception as e:  # unsupported version / OOM / offline -> skip gracefully
         print(f"[smolvlm probe unavailable] {type(e).__name__}: {e}")
         out = None

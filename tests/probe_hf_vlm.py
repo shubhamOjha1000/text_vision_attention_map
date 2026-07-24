@@ -254,7 +254,7 @@ def make_hf_vlm_output(
         text_mask = (input_ids != img_id) & (input_ids != pad_id)
 
         return ProbeOutput(input_ids, image_mask, text_mask, raw_scores, post_softmax,
-                           expected_num_image_tokens=None, name=name)
+                           expected_num_image_tokens=None, name=name, question=question)
     except Exception as e:  # gated / OOM / unsupported / offline -> skip gracefully
         print(f"[{name} probe unavailable] {type(e).__name__}: {e}")
         return None

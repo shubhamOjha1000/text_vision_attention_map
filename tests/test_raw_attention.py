@@ -61,6 +61,7 @@ class ProbeOutput:
     post_softmax: Dict[int, torch.Tensor]   # layer -> [H, L, L]  model attention
     expected_num_image_tokens: Optional[int] = None
     name: str = "probe"
+    question: str = ""                 # the user's question text (for rater span scoping)
     L: int = field(init=False)
 
     def __post_init__(self):

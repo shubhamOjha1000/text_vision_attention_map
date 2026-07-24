@@ -62,6 +62,44 @@ def is_structural_token(tok: Optional[str]) -> bool:
     return False
 
 
+def _detok_piece(tok: Optional[str]) -> str:
+    """De-tokenise a single token into readable text (keep length; no strip)."""
+    if tok is None:
+        return ""
+    for k, v in _MARKER_MAP.items():
+        tok = tok.replace(k, v)
+    return tok
+
+
+def question_span_mask(text_tokens: Sequence[str], question: str) -> torch.Tensor:
+    """
+    bool[L_t]: True for text tokens that fall inside the user's `question` string,
+    False for chat-template scaffolding (role markers like "User:"/"Assistant:",
+    generation prompt, delimiters). Robust to sub-word splits: it reconstructs the
+    text from the tokens and maps the question's character span back to tokens.
+    Falls back to all-True (no scoping) if the question can't be located.
+    """
+    L_t = len(text_tokens)
+    q = (question or "").strip()
+    if not q:
+        return torch.ones(L_t, dtype=torch.bool)
+
+    pieces = [_detok_piece(t) for t in text_tokens]
+    text = "".join(pieces)
+    idx = text.find(q)
+    if idx < 0:                                   # exact match failed -> don't scope
+        return torch.ones(L_t, dtype=torch.bool)
+
+    mask = torch.zeros(L_t, dtype=torch.bool)
+    pos = 0
+    for i, p in enumerate(pieces):
+        start, end = pos, pos + len(p)
+        if end > idx and start < idx + len(q):    # token overlaps the question span
+            mask[i] = True
+        pos = end
+    return mask if mask.any() else torch.ones(L_t, dtype=torch.bool)
+
+
 def content_text_mask(text_tokens: Sequence[str],
                       tokenizer=None) -> torch.Tensor:
     """
@@ -130,6 +168,7 @@ def select_important_text_tokens(
     text_tokens: Optional[Sequence[str]] = None,
     tokenizer=None,
     content_mask: Optional[torch.Tensor] = None,
+    question: Optional[str] = None,
     band: Optional[Sequence[int]] = None,
     pct: float = 0.5,
     vision_weights: Optional[torch.Tensor] = None,   # gaze hook: [L_v], defaults uniform
@@ -160,6 +199,9 @@ def select_important_text_tokens(
             raise ValueError("provide content_mask or text_tokens for suppression")
         content_mask = content_text_mask(text_tokens, tokenizer)
     content_mask = content_mask.bool()
+    # optional: scope to the user's question span (drop chat-template scaffolding)
+    if question is not None and text_tokens is not None:
+        content_mask = content_mask & question_span_mask(text_tokens, question)
     content_idx = torch.nonzero(content_mask, as_tuple=False).squeeze(-1)
     L_t_prime = int(content_idx.numel())
     if L_t_prime == 0:
@@ -219,19 +261,22 @@ def sliced_maps_from_full(raw_scores_full: Dict[int, torch.Tensor],
     return maps, tpos, vpos
 
 
-def select_from_extractor(out, *, tokenizer=None, band=None, pct=0.5,
-                          vision_weights=None) -> RaterResult:
+def select_from_extractor(out, *, tokenizer=None, question=None, band=None,
+                          pct=0.5, vision_weights=None) -> RaterResult:
     """
     Accepts the dict returned by `get_attention_maps` OR an
     `attention_extractor.AttentionMapResult`, and runs the rater selection.
+    Pass `question` to scope raters to the user's question span.
     """
     if isinstance(out, dict):
         maps_per_head = out["maps_per_head"]
         text_tokens = out["text_tokens"]
+        question = question if question is not None else out.get("prompt")
     else:  # AttentionMapResult
         maps_per_head = out.maps_per_head
         text_tokens = out.text_tokens
+        question = question if question is not None else getattr(out, "prompt", None)
     return select_important_text_tokens(
         maps_per_head, text_tokens=text_tokens, tokenizer=tokenizer,
-        band=band, pct=pct, vision_weights=vision_weights,
+        question=question, band=band, pct=pct, vision_weights=vision_weights,
     )

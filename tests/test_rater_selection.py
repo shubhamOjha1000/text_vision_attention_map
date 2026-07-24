@@ -34,8 +34,19 @@ from rater_selection import (  # noqa: E402
     content_text_mask,
     default_band,
     is_structural_token,
+    question_span_mask,
     select_important_text_tokens,
 )
+
+
+# a SmolVLM-style chat-template token layout: scaffolding around a question
+CHAT_TOKENS = [
+    "<|im_start|>", "User", ":",
+    "How", "Ġmany", "Ġcats", "Ġare", "Ġin", "Ġthe", "Ġimage", "?",
+    "<end_of_utterance>", "Ċ", "Ass", "istant", ":",
+]
+QUESTION = "How many cats are in the image?"
+QUESTION_IDX = [3, 4, 5, 6, 7, 8, 9, 10]   # How..image? (the question span)
 
 
 # --------------------------------------------------------------------------- #
@@ -53,10 +64,10 @@ class RaterCase:
 
 
 def make_case(maps_per_head, text_tokens, *, pct=0.5, band=None,
-              tokenizer=None, name="case") -> RaterCase:
+              tokenizer=None, question=None, name="case") -> RaterCase:
     res = select_important_text_tokens(
         maps_per_head, text_tokens=text_tokens, tokenizer=tokenizer,
-        band=band, pct=pct)
+        question=question, band=band, pct=pct)
     return RaterCase(maps_per_head, list(text_tokens), pct, res.band,
                      tokenizer, res, name)
 
@@ -207,6 +218,37 @@ def test_content_mask_suppresses_structural():
 
 def test_default_band_middle_third():
     assert default_band([0, 1, 2, 3, 4, 5]) == [2, 3]
+
+
+def test_question_span_mask_isolates_question():
+    mask = question_span_mask(CHAT_TOKENS, QUESTION)
+    assert mask.nonzero().squeeze(-1).tolist() == QUESTION_IDX
+    # role markers / generation prompt are excluded
+    for i, tok in enumerate(CHAT_TOKENS):
+        if tok in ("User", "Ass", "istant") or (tok == ":" and i not in QUESTION_IDX):
+            assert not mask[i]
+
+
+def test_question_scoping_drops_chat_scaffolding():
+    # build a map where 'Assistant:' scaffolding attends strongly to the image,
+    # so WITHOUT scoping it would be selected; scoping must exclude it.
+    H, L_v = 2, 6
+    L_t = len(CHAT_TOKENS)
+    g = torch.Generator().manual_seed(0)
+    maps = {}
+    for l in range(4):
+        P = torch.randn(H, L_t, L_v, generator=g) * 0.3
+        P[:, 13, :] += 9.0   # 'Ass' scaffolding: huge (would win without scoping)
+        P[:, 5, :] += 4.0    # 'cats': grounded question word
+        maps[l] = P
+    res = select_important_text_tokens(
+        maps, text_tokens=CHAT_TOKENS, question=QUESTION, band=[0, 1, 2, 3], pct=0.5)
+    kept = res.kept_tokens(CHAT_TOKENS)
+    assert "Ass" not in kept and "istant" not in kept and "User" not in kept
+    assert "Ġcats" in kept
+    # every kept token lies in the question span
+    for i in res.rater_mask.nonzero().squeeze(-1).tolist():
+        assert i in QUESTION_IDX
 
 
 def test_grounded_tokens_are_kept_and_bos_suppressed():

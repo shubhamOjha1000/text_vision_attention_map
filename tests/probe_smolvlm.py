@@ -74,7 +74,10 @@ def _make_raw_capturing_eager(max_layers: int):
                 return h
             return h[:, :, None, :, :].expand(b, kv, n, s, d).reshape(b, kv * n, s, d)
 
-    def fn(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
+    def fn(module, query, key, value, attention_mask=None, scaling=None,
+           dropout=0.0, **kwargs):
+        if scaling is None:
+            scaling = getattr(module, "scaling", 1.0)
         ng = getattr(module, "num_key_value_groups", 1)
         k = repeat_kv(key, ng)
         v = repeat_kv(value, ng)
@@ -93,6 +96,30 @@ def _make_raw_capturing_eager(max_layers: int):
         return out, None
 
     return fn
+
+
+def _patch_eager_globals(new_fn):
+    """Replace the module-level `eager_attention_forward` in every loaded
+    transformers model file with `new_fn`. With `attn_implementation="eager"`,
+    each attention module resolves that name from its module globals at call
+    time, so this makes the model use our raw-capturing version. Returns the list
+    of (module, original_fn) so it can be restored. This is version-robust:
+    recent transformers dispatch "eager" to this module-level function, NOT
+    through ALL_ATTENTION_FUNCTIONS (which does not even contain an "eager" key)."""
+    import sys
+    patched = []
+    for name, mod in list(sys.modules.items()):
+        if not name.startswith("transformers.models."):
+            continue
+        if getattr(mod, "eager_attention_forward", None) is not None:
+            patched.append((mod, mod.eager_attention_forward))
+            mod.eager_attention_forward = new_fn
+    return patched
+
+
+def _unpatch_eager_globals(patched):
+    for mod, orig in patched:
+        mod.eager_attention_forward = orig
 
 
 def _load_demo_image():
@@ -143,10 +170,6 @@ def make_smolvlm_output(model_id: Optional[str] = None,
             from transformers import AutoModelForImageTextToText as _AutoVLM
         except Exception:
             from transformers import AutoModelForVision2Seq as _AutoVLM
-        try:
-            from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-        except Exception:
-            from transformers.integrations import ALL_ATTENTION_FUNCTIONS
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.float16 if device == "cuda" else torch.float32
@@ -170,13 +193,14 @@ def make_smolvlm_output(model_id: Optional[str] = None,
         inp = processor(text=prompt, images=[image], return_tensors="pt").to(device)
 
         # ---- swap in the raw-capturing eager attention for the forward ----
-        orig = ALL_ATTENTION_FUNCTIONS["eager"]
-        ALL_ATTENTION_FUNCTIONS["eager"] = _make_raw_capturing_eager(max_layers)
+        patched = _patch_eager_globals(_make_raw_capturing_eager(max_layers))
+        assert patched, ("no transformers `eager_attention_forward` found to patch; "
+                         "this transformers version may use a different attention path.")
         try:
             with torch.no_grad():
                 model(**inp)
         finally:
-            ALL_ATTENTION_FUNCTIONS["eager"] = orig
+            _unpatch_eager_globals(patched)
 
         input_ids = inp["input_ids"][0].cpu()
         L = int(input_ids.shape[0])

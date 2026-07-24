@@ -76,6 +76,22 @@ def _make_raw_capturing_eager(max_layers: int):
     return fn
 
 
+def _load_demo_image():
+    """Fetch a demo image with plain PIL (+requests). Avoids
+    `transformers.image_utils.load_image`, whose `from PIL._typing import _Ink`
+    breaks against the Pillow already loaded in some Colab kernels. Falls back to
+    a blank image if there's no network."""
+    from PIL import Image
+    url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+    try:
+        import io
+        import requests
+        data = requests.get(url, timeout=30).content
+        return Image.open(io.BytesIO(data)).convert("RGB")
+    except Exception:
+        return Image.new("RGB", (384, 384), (127, 127, 127))
+
+
 def _find_image_token_id(model, processor):
     for cfg in (model.config, getattr(model.config, "text_config", None)):
         tid = getattr(cfg, "image_token_id", None)
@@ -107,7 +123,6 @@ def make_smolvlm_output(model_id: Optional[str] = None,
             from transformers import AutoModelForImageTextToText as _AutoVLM
         except Exception:
             from transformers import AutoModelForVision2Seq as _AutoVLM
-        from transformers.image_utils import load_image
         try:
             from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
         except Exception:
@@ -127,7 +142,7 @@ def make_smolvlm_output(model_id: Optional[str] = None,
             model_id, torch_dtype=dtype, attn_implementation="eager").to(device).eval()
 
         # ---- build one (image, prompt) input via the chat template ----
-        image = load_image("http://images.cocodataset.org/val2017/000000039769.jpg")
+        image = _load_demo_image()
         messages = [{"role": "user", "content": [
             {"type": "image"},
             {"type": "text", "text": "How many cats are in the image?"}]}]

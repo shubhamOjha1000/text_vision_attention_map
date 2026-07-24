@@ -267,19 +267,30 @@ def test_raw_differs_from_post_softmax(probe):
 # =========================================================================== #
 def test_argmax_of_raw_matches_argmax_of_post(probe):
     """
-    Softmax is strictly monotonic, so the top-attended key by raw score must
-    equal the top-attended key by the model's attention -- per head, per query.
-    Precision-robust: no tolerance needed.
+    Softmax is monotonic, so the top-attended key by raw score should be the
+    top-attended key by the model's attention -- per head, per query.
+
+    We do NOT require the exact same index: under low-precision weights (e.g.
+    4-bit / bf16 attention) two near-equal keys can round to the same post-softmax
+    probability, so `argmax` (which breaks ties by lowest index) may pick a
+    different one of the tied keys for `raw` vs `post`. Instead we require that
+    raw's top key is (near-)maximal in post -- the probability gap between post's
+    max and post at raw's argmax must be ~0. A genuine capture error (raw's top
+    key pointing somewhere with low attention) still fails loudly with a big gap.
     """
+    ATOL = 5e-3
     for layer in probe.raw_scores:
         raw = probe.raw_scores[layer]
         post = probe.post_softmax[layer]
-        # ignore fully-masked query rows (all-zero post) if any
-        allowed_row = post.sum(dim=-1) > 0                    # [H, L]
-        raw_arg = raw.argmax(dim=-1)
-        post_arg = post.argmax(dim=-1)
-        assert torch.equal(raw_arg[allowed_row], post_arg[allowed_row]), \
-            f"layer {layer}: argmax(raw) != argmax(post)"
+        allowed_row = post.sum(dim=-1) > 0                        # [H, L]
+        raw_arg = raw.argmax(dim=-1, keepdim=True)               # [H, L, 1]
+        post_at_raw_arg = post.gather(-1, raw_arg).squeeze(-1)   # post prob at raw's top key
+        gap = (post.max(dim=-1).values - post_at_raw_arg)[allowed_row]
+        if gap.numel() == 0:
+            continue
+        assert gap.max().item() <= ATOL, \
+            f"layer {layer}: raw's top key is not top-attention in post " \
+            f"(max prob gap {gap.max().item():.2e})"
 
 
 def test_softmax_of_raw_reconstructs_post_softmax(probe):

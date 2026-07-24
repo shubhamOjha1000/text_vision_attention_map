@@ -31,6 +31,25 @@ from typing import Optional
 
 import torch
 
+
+def _shim_pil_ink():
+    """Some `transformers` versions do `from PIL._typing import _Ink` at import
+    time (e.g. inside `transformers.image_utils`, which the processor pulls in).
+    Older Pillow builds shipped on Colab lack `_Ink`, raising
+    `ImportError: cannot import name '_Ink' from 'PIL._typing'`. `_Ink` is only a
+    type alias, so injecting a harmless placeholder makes the import succeed with
+    no restart / Pillow reinstall. Must run BEFORE transformers is imported."""
+    try:
+        import typing
+        import PIL._typing as _pt
+        if not hasattr(_pt, "_Ink"):
+            _pt._Ink = typing.Any
+    except Exception:
+        pass
+
+
+_shim_pil_ink()
+
 # --- import ProbeOutput from the sibling test module (by path; robust in Colab) ---
 _here = os.path.dirname(os.path.abspath(__file__))
 _spec = importlib.util.spec_from_file_location(
@@ -118,6 +137,7 @@ def make_smolvlm_output(model_id: Optional[str] = None,
 
     model_id = model_id or os.environ.get("SMOLVLM_ID", "HuggingFaceTB/SmolVLM2-2.2B-Instruct")
     try:
+        _shim_pil_ink()  # ensure PIL._typing._Ink exists before transformers imports
         from transformers import AutoProcessor
         try:
             from transformers import AutoModelForImageTextToText as _AutoVLM

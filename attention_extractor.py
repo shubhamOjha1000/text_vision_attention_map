@@ -1,13 +1,13 @@
 """
-Text -> Vision attention-map extractor for PaliGemma.
+Text -> Vision RAW attention-score extractor for PaliGemma.
 
 Goal
 ----
-Reproduce the *exact* attention map that SparseVLM builds its priority matrix `P`
-from -- i.e. the language-model decoder self-attention `A = Softmax(Q K^T / sqrt(d))`
--- and slice it into
+Return the language-model decoder's **raw, pre-softmax** attention scores
+`S = Q K^T / sqrt(d)` (NOT the post-softmax distribution `Softmax(S)`), sliced
+into
 
-        P  =  A[ text_token_rows , vision_token_cols ]        # [L_t, L_v]
+        P  =  S[ text_token_rows , vision_token_cols ]        # [L_t, L_v]
 
 so that **text tokens are the rows and visual tokens are the columns**.
 
@@ -15,15 +15,20 @@ Difference from SparseVLM
 -------------------------
 This module has NOTHING to do with pruning / sparsification. We do not select
 "raters" and we do not drop any tokens. **ALL text tokens are kept in the rows.**
-We only read the attention map out of the model and return it.
+We only read the raw scores out of the model and return them.
 
 How the map is obtained
 -----------------------
-The genuine decoder attention `attn_weights` is computed inside
-`GemmaAttention.forward` (modeling_gemma.py, line ~361) and returned as the 2nd
-element of its output tuple. We attach a `forward_hook` on every `GemmaAttention`
-module and capture that tensor during a single prefill pass -- this is the real
-`A`, not a re-derived similarity. We then slice text-rows x vision-cols.
+Inside `GemmaAttention.forward` (modeling_gemma.py, ~line 331) the raw scores
+`Q K^T / sqrt(d)` are stashed on the module as `_raw_attn_scores`, *before* the
+attention mask is added and *before* softmax. We attach a `forward_hook` on every
+`GemmaAttention` module and read that attribute during a single prefill pass --
+these are the genuine raw scores, not a re-derived similarity and not the
+softmax'd map. We then slice text-rows x vision-cols.
+
+Note: raw scores are unnormalized logits, meaningful up to a per-row additive
+constant (softmax is shift-invariant). Use them for ranking / differences /
+custom-temperature re-softmaxing, not as absolute magnitudes.
 
 The PaliGemma model (SigLIP + Gemma) lives in this same folder -- it is the
 paper's implementation with the SparseVLM pruning stripped out (pure inference),
@@ -44,9 +49,9 @@ from utils import load_hf_model
 @dataclass
 class AttentionMapResult:
     """Container for one (image, prompt) extraction."""
-    # Per-layer text->vision attention maps, head-averaged. Each: [L_t, L_v]
+    # Per-layer text->vision RAW (pre-softmax) score maps, head-averaged. Each: [L_t, L_v]
     maps: Dict[int, torch.Tensor]
-    # Per-layer maps with heads kept separately. Each: [num_heads, L_t, L_v]
+    # Per-layer RAW score maps with heads kept separately. Each: [num_heads, L_t, L_v]
     maps_per_head: Dict[int, torch.Tensor]
     # String tokens for the rows (text) and a simple index list for cols (vision)
     text_tokens: List[str]          # length L_t   -> row labels
@@ -67,8 +72,11 @@ class AttentionMapResult:
 
     def visual_significance(self, layer: Optional[int] = None) -> torch.Tensor:
         """
-        Collapse rows -> one score per visual token (the paper's `p_bar`):
+        Collapse rows -> one raw-score per visual token:
             p_bar = (1 / L_t) * sum_over_text_rows( P )      -> [L_v]
+        NOTE: P here holds RAW pre-softmax scores, so this is a mean of raw
+        logits (up to a per-row additive constant), not the paper's post-softmax
+        `p_bar`. Use for ranking patches; renormalize if you need a distribution.
         `layer=None` uses the layer-averaged map.
         """
         p = self.mean_over_layers() if layer is None else self.maps[layer]
@@ -108,10 +116,10 @@ class AttentionMapExtractor:
                 self._handles.append(handle)
 
     def _make_hook(self, layer_idx: int):
-        def hook(_module, _inputs, output):
-            # output == (attn_output, attn_weights)
-            # attn_weights: [B, num_heads, q_len, kv_len]  <-- the genuine A
-            self._captured[layer_idx] = output[1].detach().to("cpu")
+        def hook(_module, _inputs, _output):
+            # _module._raw_attn_scores: [B, num_heads, q_len, kv_len]
+            # == the RAW pre-softmax scores QKᵀ/√d (NOT the softmax distribution)
+            self._captured[layer_idx] = _module._raw_attn_scores.detach().to("cpu")
         return hook
 
     def remove_hooks(self):
@@ -161,11 +169,11 @@ class AttentionMapExtractor:
             ids[text_positions].tolist()
         )
 
-        # ---- slice each captured map: rows = text, cols = vision ----
+        # ---- slice each captured RAW-score map: rows = text, cols = vision ----
         maps: Dict[int, torch.Tensor] = {}
         maps_per_head: Dict[int, torch.Tensor] = {}
         for layer_idx, attn in self._captured.items():
-            # attn: [1, H, L, L]  (prefill -> q_len == kv_len == L)
+            # attn: [1, H, L, L]  raw pre-softmax scores (prefill -> q_len == kv_len == L)
             attn = attn[0]                                   # [H, L, L]
             p_heads = attn[:, text_positions][:, :, vision_positions]  # [H, L_t, L_v]
             maps_per_head[layer_idx] = p_heads

@@ -329,6 +329,12 @@ class GemmaAttention(nn.Module):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
         # Perform the calculation as usual, Q * K^T / sqrt(head_dim). Shape: [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # Stash the RAW pre-softmax attention scores (QKᵀ/√d), before the
+        # attention_mask is added and before softmax. The attention-map
+        # extractors read this attribute so the returned maps are the raw
+        # scores, NOT the post-softmax distribution. The model still runs
+        # softmax below to actually compute attention.
+        self._raw_attn_scores = attn_weights.detach()
         mask = (attn_weights != 0).float()
 
         """

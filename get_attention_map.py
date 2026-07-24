@@ -1,42 +1,33 @@
 """
-PaliGemma VLM inference + text->vision attention map at the decoder layer(s) YOU pick.
+PaliGemma VLM inference + text->vision RAW attention scores for ALL decoder layers.
 
 What it does
 ------------
-1. Loads PaliGemma (SigLIP + Gemma) from `--model_path`.
+1. Loads PaliGemma (SigLIP + Gemma) from `model_path`.
 2. Runs ONE forward (prefill) over (image, prompt)  -> this is the inference step
-   that produces the decoder self-attention A = Softmax(Q Kᵀ / √d).
-3. Hooks ONLY the decoder layer(s) you ask for (`--layers 0 5 17`) and grabs that
-   layer's genuine attention `attn_weights` [B, H, L, L].
-4. Slices it into the text->vision map with **text tokens in rows, vision tokens
+   that computes the decoder self-attention scores S = Q Kᵀ / √d.
+3. Hooks EVERY decoder layer and grabs each layer's RAW pre-softmax scores
+   `_raw_attn_scores` [B, H, L, L]  (NOT softmax).
+4. Slices them into the text->vision map with **text tokens in rows, vision tokens
    in columns**:
-        P = A[text_positions][:, vision_positions]      # [L_t, L_v]
+        P = S[text_positions][:, vision_positions]      # [L_t, L_v]
 
 No SparseVLM, no pruning, no rater selection -> every text token is kept.
 
-Run
----
-python get_attention_map.py \
-    --model_path /path/to/paligemma-3b-pt-224 \
-    --image      /path/to/car.png \
-    --prompt     "Color of car is Black right?" \
-    --layers 0 \
-    --save_dir   ./out          # optional: dumps map.pt (+ heatmap if matplotlib)
-
-Import as a library
--------------------
+Use as a library
+----------------
     from get_attention_map import get_attention_maps, load_paligemma
     model, processor, device = load_paligemma(model_path)
     out = get_attention_maps(model, processor, device,
                              prompt="What color is the car?",
-                             image_path="car.png", layers=[0])
-    P       = out["maps"][0]            # [L_t, L_v]  head-averaged
-    P_heads = out["maps_per_head"][0]   # [H, L_t, L_v]
+                             image_path="car.png")
+    P       = out["maps"][0]            # layer-0 map [L_t, L_v]  head-averaged (raw scores)
+    P_heads = out["maps_per_head"][0]   # layer-0 per head [H, L_t, L_v]
     rows    = out["text_tokens"]        # row labels (len L_t)
+    # out["maps"] has one entry per decoder layer: {0, 1, ..., num_hidden_layers-1}
 """
 
-import argparse
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import torch
 from PIL import Image
@@ -71,31 +62,29 @@ def load_paligemma(model_path: str, device: Optional[str] = None):
 
 
 @torch.no_grad()
-def get_attention_maps(model, processor, device, prompt: str, image_path: str,
-                       layers: List[int]) -> Dict:
+def get_attention_maps(model, processor, device, prompt: str, image_path: str) -> Dict:
     """
-    Returns text->vision attention maps for the requested decoder `layers`.
+    Returns text->vision RAW (pre-softmax) score maps for EVERY decoder layer.
 
     Output dict:
-        maps          : {layer_idx: Tensor [L_t, L_v]}          head-averaged
+        maps          : {layer_idx: Tensor [L_t, L_v]}          head-averaged raw scores
         maps_per_head : {layer_idx: Tensor [num_heads, L_t, L_v]}
         text_tokens   : List[str]  length L_t   (row labels)
         vision_positions / text_positions : LongTensor indices in the full seq
     """
-    # ---- capture buffer + hooks on ONLY the requested layers ----
+    # ---- capture buffer + hooks on EVERY decoder self-attention layer ----
     captured: Dict[int, torch.Tensor] = {}
     handles = []
 
     def make_hook(layer_idx):
-        def hook(_module, _inp, output):
-            # GemmaAttention.forward returns (attn_output, attn_weights)
-            # attn_weights: [B, num_heads, q_len, kv_len]  <-- the genuine A
-            captured[layer_idx] = output[1].detach().to("cpu")
+        def hook(_module, _inp, _output):
+            # _module._raw_attn_scores: [B, num_heads, q_len, kv_len]
+            # == the RAW pre-softmax scores QKᵀ/√d (NOT the softmax distribution)
+            captured[layer_idx] = _module._raw_attn_scores.detach().to("cpu")
         return hook
 
-    wanted = set(layers)
     for module in model.modules():
-        if isinstance(module, GemmaAttention) and module.layer_idx in wanted:
+        if isinstance(module, GemmaAttention):
             handles.append(module.register_forward_hook(make_hook(module.layer_idx)))
 
     try:
@@ -119,10 +108,8 @@ def get_attention_maps(model, processor, device, prompt: str, image_path: str,
         for h in handles:
             h.remove()
 
-    missing = wanted - set(captured)
-    if missing:
-        raise RuntimeError(f"No attention captured for layer(s) {sorted(missing)}; "
-                           f"model has {model.config.text_config.num_hidden_layers} layers.")
+    if not captured:
+        raise RuntimeError("No attention captured; no GemmaAttention layers were hooked.")
 
     # ---- text vs vision positions (the model's own rule) ----
     image_token_index = model.config.image_token_index
@@ -134,10 +121,10 @@ def get_attention_maps(model, processor, device, prompt: str, image_path: str,
     vision_positions = torch.nonzero(image_mask, as_tuple=False).squeeze(-1).cpu()
     text_tokens = processor.tokenizer.convert_ids_to_tokens(ids[text_positions].tolist())
 
-    # ---- slice each captured layer: rows = text, cols = vision ----
+    # ---- slice each captured RAW-score layer: rows = text, cols = vision ----
     maps, maps_per_head = {}, {}
     for layer_idx, attn in captured.items():
-        attn = attn[0]                                              # [H, L, L]
+        attn = attn[0]                                              # [H, L, L] raw pre-softmax
         p_heads = attn[:, text_positions][:, :, vision_positions]   # [H, L_t, L_v]
         maps_per_head[layer_idx] = p_heads
         maps[layer_idx] = p_heads.mean(dim=0)                       # [L_t, L_v]
@@ -150,67 +137,3 @@ def get_attention_maps(model, processor, device, prompt: str, image_path: str,
         "vision_positions": vision_positions,
         "prompt": prompt,
     }
-
-
-def _maybe_plot(P, text_tokens, layer, path):
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except Exception as e:
-        print(f"[plot skipped] matplotlib unavailable: {e}")
-        return
-    fig, ax = plt.subplots(figsize=(12, max(4, len(text_tokens) * 0.35)))
-    im = ax.imshow(P.numpy(), aspect="auto", cmap="viridis")
-    ax.set_yticks(range(len(text_tokens)))
-    ax.set_yticklabels(text_tokens, fontsize=8)
-    ax.set_xlabel(f"vision tokens (L_v = {P.shape[1]})")
-    ax.set_ylabel("text tokens (rows)")
-    ax.set_title(f"Text -> Vision attention  P  (layer {layer})")
-    fig.colorbar(im, ax=ax, fraction=0.02)
-    fig.tight_layout(); fig.savefig(path, dpi=130); plt.close(fig)
-    print(f"[saved] {path}")
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model_path", default="google/paligemma-3b-pt-224",
-                    help="HF Hub repo id (auto-downloaded) or a local weights dir")
-    ap.add_argument("--image", required=True)
-    ap.add_argument("--prompt", required=True)
-    ap.add_argument("--layers", nargs="+", type=int, default=[0],
-                    help="decoder layer index/indices to extract, e.g. --layers 0 5 17")
-    ap.add_argument("--save_dir", default=None)
-    ap.add_argument("--only_cpu", action="store_true")
-    args = ap.parse_args()
-
-    device = "cpu" if args.only_cpu else None
-    print("Loading model ...")
-    model, processor, device = load_paligemma(args.model_path, device)
-    print("Device:", device)
-
-    out = get_attention_maps(model, processor, device,
-                             args.prompt, args.image, args.layers)
-
-    print("\n=== Text -> Vision attention map ===")
-    print("prompt          :", out["prompt"])
-    print("L_t (text rows) :", len(out["text_tokens"]))
-    print("L_v (vision col):", out["vision_positions"].numel())
-    print("row labels      :", out["text_tokens"])
-    for layer in args.layers:
-        P = out["maps"][layer]
-        print(f"layer {layer}: P.shape = {tuple(P.shape)} (L_t, L_v) | "
-              f"per-head = {tuple(out['maps_per_head'][layer].shape)} (H, L_t, L_v)")
-
-    if args.save_dir:
-        import os
-        os.makedirs(args.save_dir, exist_ok=True)
-        torch.save(out, os.path.join(args.save_dir, "map.pt"))
-        print(f"[saved] {os.path.join(args.save_dir, 'map.pt')}")
-        for layer in args.layers:
-            _maybe_plot(out["maps"][layer], out["text_tokens"], layer,
-                        os.path.join(args.save_dir, f"layer{layer}.png"))
-
-
-if __name__ == "__main__":
-    main()

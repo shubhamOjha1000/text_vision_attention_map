@@ -205,6 +205,20 @@ def select_important_text_tokens(
 # --------------------------------------------------------------------------- #
 # Convenience wrapper for the extractor output
 # --------------------------------------------------------------------------- #
+def sliced_maps_from_full(raw_scores_full: Dict[int, torch.Tensor],
+                          image_mask: torch.Tensor,
+                          text_mask: torch.Tensor):
+    """
+    Slice full-sequence attention {layer: [H, L, L]} (e.g. a probe's raw_scores)
+    into the text->vision block {layer: [H, L_t, L_v]} the rater selector expects.
+    Returns (maps_per_head, text_positions, vision_positions).
+    """
+    tpos = torch.nonzero(text_mask.bool(), as_tuple=False).squeeze(-1)
+    vpos = torch.nonzero(image_mask.bool(), as_tuple=False).squeeze(-1)
+    maps = {l: A[:, tpos][:, :, vpos] for l, A in raw_scores_full.items()}
+    return maps, tpos, vpos
+
+
 def select_from_extractor(out, *, tokenizer=None, band=None, pct=0.5,
                           vision_weights=None) -> RaterResult:
     """

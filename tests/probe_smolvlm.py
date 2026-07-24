@@ -191,6 +191,9 @@ def make_smolvlm_output(model_id: Optional[str] = None,
             {"type": "text", "text": "How many cats are in the image?"}]}]
         prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
         inp = processor(text=prompt, images=[image], return_tensors="pt").to(device)
+        assert "input_ids" in inp, "processor returned no input_ids"
+        assert "pixel_values" in inp, ("processor returned no pixel_values -- the image "
+                                       "was dropped; check the processor call / chat template")
 
         # ---- swap in the raw-capturing eager attention for the forward ----
         patched = _patch_eager_globals(_make_raw_capturing_eager(max_layers))

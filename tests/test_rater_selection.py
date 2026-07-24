@@ -33,7 +33,9 @@ from rater_selection import (  # noqa: E402
     RaterResult,
     content_text_mask,
     default_band,
+    is_punctuation_token,
     is_structural_token,
+    is_suppressed_token,
     question_span_mask,
     select_important_text_tokens,
 )
@@ -97,11 +99,11 @@ def check_raters_subset_of_content(case):
     assert torch.equal(m.rater_mask & m.content_mask, m.rater_mask)
 
 
-def check_no_structural_token_selected(case):
-    """#4: structural/special tokens are never selected as raters."""
+def check_no_suppressed_token_selected(case):
+    """#4: structural/special/whitespace AND punctuation tokens are never raters."""
     for tok, kept in zip(case.text_tokens, case.res.rater_mask.tolist()):
         if kept:
-            assert not is_structural_token(tok), f"structural token selected: {tok!r}"
+            assert not is_suppressed_token(tok), f"suppressed token selected: {tok!r}"
 
 
 def check_topk_count_formula(case):
@@ -160,7 +162,7 @@ ALL_CHECKS = [
     check_importance_is_column_vector,
     check_thresholding_reduces_count,
     check_raters_subset_of_content,
-    check_no_structural_token_selected,
+    check_no_suppressed_token_selected,
     check_topk_count_formula,
     check_importance_valid_distribution,
     check_kept_are_topk_by_importance,
@@ -209,6 +211,19 @@ def test_structural_detection():
         assert is_structural_token(t)
     for t in ("▁cat", "cat"):
         assert not is_structural_token(t)
+
+
+def test_punctuation_detection():
+    for t in ("?", ":", ".", ",", "!", "...", "Ġ?", "—", "”"):
+        assert is_punctuation_token(t), t
+    for t in ("cat", "Ġcats", "2", "▁5", "'s"):     # words and numbers are kept
+        assert not is_punctuation_token(t), t
+
+
+def test_punctuation_is_suppressed_from_content():
+    toks = ["Ġcat", "?", "Ġsits", ":", "Ġmat"]
+    keep = content_text_mask(toks)
+    assert keep.tolist() == [True, False, True, False, True]
 
 
 def test_content_mask_suppresses_structural():

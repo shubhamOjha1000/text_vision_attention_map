@@ -26,6 +26,7 @@ raw scores.
 """
 
 import re
+import string
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
@@ -60,6 +61,26 @@ def is_structural_token(tok: Optional[str]) -> bool:
     if _SPECIAL_RE.match(tok):           # <...> or <|...|> special format
         return True
     return False
+
+
+# punctuation-only tokens (?, :, ., ,, !, ", ...) carry no visual grounding
+_EXTRA_PUNCT = "…—–“”‘’·•«»¿¡"
+
+
+def is_punctuation_token(tok: Optional[str]) -> bool:
+    """True if `tok` is punctuation-only (no alphanumeric chars). Numbers are
+    NOT punctuation (kept -- they can matter, e.g. counting)."""
+    if tok is None:
+        return False
+    c = _clean_token(tok)
+    if c == "":
+        return False                     # whitespace -> handled by is_structural
+    return not any(ch.isalnum() for ch in c)
+
+
+def is_suppressed_token(tok: Optional[str]) -> bool:
+    """A token to drop before rating: structural/special/whitespace OR punctuation."""
+    return is_structural_token(tok) or is_punctuation_token(tok)
 
 
 def _detok_piece(tok: Optional[str]) -> str:
@@ -110,7 +131,7 @@ def content_text_mask(text_tokens: Sequence[str],
     L_t = len(text_tokens)
     keep = torch.ones(L_t, dtype=torch.bool)
     for i, tok in enumerate(text_tokens):
-        if is_structural_token(tok):
+        if is_suppressed_token(tok):          # structural/special/whitespace OR punctuation
             keep[i] = False
     if tokenizer is not None:
         try:

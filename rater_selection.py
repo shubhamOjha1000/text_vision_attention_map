@@ -15,7 +15,8 @@ Flow (matches the diagram / SparseVLM Eq. 6), with the locked design choices:
   2. per (layer, head): softmax DOWN the text axis, per image column
                                           -> "distribution over text for each
                                              image token" (softmax BEFORE averaging)
-  3. mean over heads (3.2), then mean over a BAND of layers (3.1)
+  3. mean over heads (3.2), then mean over ALL decoder layers (3.1;
+     override with band= for a subset such as the middle third)
   4. r = mean over image columns        -> importance per text token (Eq. 6)
        (optional vision_weights = gaze hook: weighted mean over image columns)
   5. top-k threshold                    -> keep  L_t' - floor(pct * L_t')  (3.4)
@@ -179,14 +180,13 @@ def content_text_mask(text_tokens: Sequence[str],
 # Layer band (decision 3.1)
 # --------------------------------------------------------------------------- #
 def default_band(layers: Sequence[int]) -> List[int]:
-    """Middle third of the available decoder layers."""
-    layers = sorted(layers)
-    n = len(layers)
-    if n <= 2:
-        return list(layers)
-    lo = n // 3
-    hi = max(lo + 1, (2 * n) // 3)
-    return list(layers[lo:hi])
+    """ALL available decoder layers (mean over every captured layer).
+
+    Note: this averages positional (early) + grounding (middle) + answer-formation
+    (late) attention together; pass an explicit `band=` (e.g. the middle third) to
+    focus on the grounding layers if that gives cleaner raters.
+    """
+    return sorted(layers)
 
 
 # --------------------------------------------------------------------------- #

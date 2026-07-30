@@ -249,8 +249,9 @@ def test_content_mask_suppresses_structural():
     assert keep.nonzero().squeeze(-1).tolist() == CONTENT_IDX
 
 
-def test_default_band_middle_third():
-    assert default_band([0, 1, 2, 3, 4, 5]) == [2, 3]
+def test_default_band_all_layers():
+    assert default_band([0, 1, 2, 3, 4, 5]) == [0, 1, 2, 3, 4, 5]
+    assert default_band([5, 0, 3, 1]) == [0, 1, 3, 5]   # sorted, all layers
 
 
 def test_question_span_mask_isolates_question():

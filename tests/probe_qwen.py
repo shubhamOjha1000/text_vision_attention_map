@@ -31,12 +31,12 @@ DEFAULT_QWEN = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 
 def make_qwen_output(model_id: Optional[str] = None,
-                     max_layers: int = 6,
+                     max_layers: Optional[int] = None,
                      load_in_4bit: bool = True) -> Optional[ProbeOutput]:
     """
     Load a Qwen2.5-VL VLM (default: 7B in 4-bit), run one forward, and return a
-    ProbeOutput of RAW pre-softmax scores + post-softmax for the first
-    `max_layers` decoder layers. Returns None (test skips) on any load failure.
+    ProbeOutput of RAW pre-softmax scores + post-softmax for the decoder layers
+    (max_layers=None -> ALL layers; set an int to cap). Returns None on failure.
     """
     model_id = model_id or os.environ.get("QWEN_VL_ID", DEFAULT_QWEN)
     hf_token = (os.environ.get("HF_TOKEN")

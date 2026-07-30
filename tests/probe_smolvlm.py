@@ -61,9 +61,10 @@ ProbeOutput = _T.ProbeOutput
 _CACHE = {"tried": False, "output": None}
 
 
-def _make_raw_capturing_eager(max_layers: int):
+def _make_raw_capturing_eager(max_layers=None):
     """A stand-in for transformers' eager_attention_forward that stashes the
-    pre-softmax scores (only for the first `max_layers` layers, to bound memory)."""
+    pre-softmax scores. max_layers=None captures ALL layers; an int caps to the
+    first `max_layers` (to bound memory)."""
     import torch.nn.functional as F
     try:
         from transformers.models.llama.modeling_llama import repeat_kv
@@ -85,11 +86,12 @@ def _make_raw_capturing_eager(max_layers: int):
         if attention_mask is not None:
             attn = attn + attention_mask[:, :, :, : k.shape[-2]]
 
-        # stash only for the first few layers to keep CPU memory bounded
-        if getattr(module, "layer_idx", 10 ** 9) < max_layers:
+        # stash all layers (max_layers=None) or only the first `max_layers`
+        _do = max_layers is None or getattr(module, "layer_idx", 10 ** 9) < max_layers
+        if _do:
             module._raw_attn_scores = attn.detach().float().cpu()   # PRE-softmax
         probs = F.softmax(attn, dim=-1, dtype=torch.float32).to(query.dtype)
-        if getattr(module, "layer_idx", 10 ** 9) < max_layers:
+        if _do:
             module._post_attn = probs.detach().float().cpu()        # POST-softmax
         probs = F.dropout(probs, p=dropout, training=module.training)
         out = torch.matmul(probs, v).transpose(1, 2).contiguous()
@@ -151,7 +153,7 @@ def _find_image_token_id(model, processor):
 
 
 def make_smolvlm_output(model_id: Optional[str] = None,
-                        max_layers: int = 6) -> Optional[ProbeOutput]:
+                        max_layers: Optional[int] = None) -> Optional[ProbeOutput]:
     """
     Load SmolVLM2, run one forward on (image, prompt), and return a ProbeOutput
     with genuine RAW pre-softmax scores + the model's post-softmax, for the first
@@ -217,6 +219,7 @@ def make_smolvlm_output(model_id: Optional[str] = None,
             if raw is None or post is None:
                 continue
             if raw.shape[-1] != L or raw.shape[-2] != L:
+                del module._raw_attn_scores, module._post_attn  # free vision stash
                 continue  # vision-encoder attention -> skip
             li = int(getattr(module, "layer_idx", len(raw_scores)))
             raw_scores[li] = raw[0].float()

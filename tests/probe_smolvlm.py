@@ -58,7 +58,31 @@ _T = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_T)
 ProbeOutput = _T.ProbeOutput
 
-_CACHE = {"tried": False, "output": None}
+_MODEL = {"loaded": False, "model": None, "processor": None, "device": None}
+
+
+def _load_smolvlm(model_id):
+    """Load SmolVLM2 (+processor) once and cache it, so multiple (image, question)
+    probes reuse the same weights."""
+    if _MODEL["loaded"]:
+        return _MODEL["model"], _MODEL["processor"], _MODEL["device"]
+    _shim_pil_ink()
+    from transformers import AutoProcessor
+    try:
+        from transformers import AutoModelForImageTextToText as _AutoVLM
+    except Exception:
+        from transformers import AutoModelForVision2Seq as _AutoVLM
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    processor = AutoProcessor.from_pretrained(model_id)
+    try:
+        processor.image_processor.do_image_splitting = False   # one tile -> shorter seq
+    except Exception:
+        pass
+    model = _AutoVLM.from_pretrained(
+        model_id, torch_dtype=dtype, attn_implementation="eager").to(device).eval()
+    _MODEL.update(loaded=True, model=model, processor=processor, device=device)
+    return model, processor, device
 
 
 def _make_raw_capturing_eager(max_layers=None):
@@ -140,6 +164,19 @@ def _load_demo_image():
         return Image.new("RGB", (384, 384), (127, 127, 127))
 
 
+def load_image(url_or_path):
+    """Load an image (URL, local path, or PIL.Image) with plain PIL (+requests)."""
+    from PIL import Image
+    if isinstance(url_or_path, Image.Image):
+        return url_or_path.convert("RGB")
+    if str(url_or_path).startswith(("http://", "https://")):
+        import io
+        import requests
+        data = requests.get(url_or_path, timeout=30).content
+        return Image.open(io.BytesIO(data)).convert("RGB")
+    return Image.open(url_or_path).convert("RGB")
+
+
 def _find_image_token_id(model, processor):
     for cfg in (model.config, getattr(model.config, "text_config", None)):
         tid = getattr(cfg, "image_token_id", None)
@@ -153,42 +190,25 @@ def _find_image_token_id(model, processor):
 
 
 def make_smolvlm_output(model_id: Optional[str] = None,
+                        image=None,
+                        question: Optional[str] = None,
                         max_layers: Optional[int] = None) -> Optional[ProbeOutput]:
     """
-    Load SmolVLM2, run one forward on (image, prompt), and return a ProbeOutput
-    with genuine RAW pre-softmax scores + the model's post-softmax, for the first
-    `max_layers` language-model decoder layers. Returns None (test skips) if the
-    model / transformers version / hardware can't support it.
+    Run one forward on (image, question) and return a ProbeOutput with genuine RAW
+    pre-softmax scores + the model's post-softmax for the decoder layers
+    (max_layers=None -> ALL layers). The model is loaded once and reused, so you
+    can probe many (image, question) pairs cheaply. Defaults: the demo cats image
+    + a counting question. Returns None (test skips) on failure.
     """
-    if _CACHE["tried"]:
-        return _CACHE["output"]
-    _CACHE["tried"] = True
-
     model_id = model_id or os.environ.get("SMOLVLM_ID", "HuggingFaceTB/SmolVLM2-2.2B-Instruct")
     try:
-        _shim_pil_ink()  # ensure PIL._typing._Ink exists before transformers imports
-        from transformers import AutoProcessor
-        try:
-            from transformers import AutoModelForImageTextToText as _AutoVLM
-        except Exception:
-            from transformers import AutoModelForVision2Seq as _AutoVLM
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = torch.float16 if device == "cuda" else torch.float32
-
-        processor = AutoProcessor.from_pretrained(model_id)
-        # one image tile -> shorter sequence -> less memory (best-effort)
-        try:
-            processor.image_processor.do_image_splitting = False
-        except Exception:
-            pass
-
-        model = _AutoVLM.from_pretrained(
-            model_id, torch_dtype=dtype, attn_implementation="eager").to(device).eval()
+        model, processor, device = _load_smolvlm(model_id)
+        if image is None:
+            image = _load_demo_image()
+        if question is None:
+            question = "How many cats are in the image?"
 
         # ---- build one (image, prompt) input via the chat template ----
-        image = _load_demo_image()
-        question = "How many cats are in the image?"
         messages = [{"role": "user", "content": [
             {"type": "image"},
             {"type": "text", "text": question}]}]
@@ -236,11 +256,8 @@ def make_smolvlm_output(model_id: Optional[str] = None,
         image_mask = input_ids == img_id
         text_mask = (input_ids != img_id) & (input_ids != pad_id)
 
-        out = ProbeOutput(input_ids, image_mask, text_mask, raw_scores, post_softmax,
-                          expected_num_image_tokens=None, name="smolvlm", question=question)
+        return ProbeOutput(input_ids, image_mask, text_mask, raw_scores, post_softmax,
+                           expected_num_image_tokens=None, name="smolvlm", question=question)
     except Exception as e:  # unsupported version / OOM / offline -> skip gracefully
         print(f"[smolvlm probe unavailable] {type(e).__name__}: {e}")
-        out = None
-
-    _CACHE["output"] = out
-    return out
+        return None

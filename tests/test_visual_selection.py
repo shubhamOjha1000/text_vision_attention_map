@@ -22,13 +22,18 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from visual_selection import (  # noqa: E402
+    TeacherLabel,
     VisualResult,
+    candidate_mask,
     image_importance,
     make_baseline,
+    make_baseline_loo,
+    pmi_scores,
     select_debiased,
     select_important_image_tokens,
     sink_token_mask,
     subtract_baseline,
+    teacher_label,
 )
 
 
@@ -224,3 +229,117 @@ def test_select_debiased_excludes_sink_and_keeps_grounded():
     assert not res.vision_mask[SINK_IMG]               # sink dropped
     assert res.vision_mask[2]                          # question-specific token kept
     assert res.importance[SINK_IMG].item() == 0.0      # A zeroed the sink
+
+
+# --------------------------------------------------------------------------- #
+# Blocker 1 -- baselines must not leak the example into its own correction
+# --------------------------------------------------------------------------- #
+def _sink_importances(question_imgs=(2, 5, 3), seed0=0):
+    rmask = _rater_mask()
+    return [image_importance(_maps_with_sink(q, seed0 + i), rmask)[0]
+            for i, q in enumerate(question_imgs)]
+
+
+def test_loo_baseline_excludes_own_contribution():
+    imps = _sink_importances()
+    loo = make_baseline_loo(imps)
+    assert loo.shape == (len(imps), L_V)
+    for i in range(len(imps)):
+        others = [x for j, x in enumerate(imps) if j != i]
+        assert torch.allclose(loo[i], make_baseline(others), atol=1e-6)
+
+
+def test_loo_baseline_row_is_independent_of_own_map():
+    """Perturbing example i must not change example i's own baseline."""
+    imps = _sink_importances()
+    before = make_baseline_loo(imps)[0].clone()
+    imps[0] = torch.rand(L_V); imps[0] /= imps[0].sum()   # scramble example 0 only
+    assert torch.allclose(make_baseline_loo(imps)[0], before, atol=1e-6)
+
+
+def test_loo_baseline_still_finds_the_sink():
+    imps = _sink_importances()
+    assert make_baseline_loo(imps)[0].argmax().item() == SINK_IMG
+
+
+def test_loo_baseline_needs_two_maps():
+    with pytest.raises(ValueError):
+        make_baseline_loo([torch.rand(L_V)])
+
+
+# --------------------------------------------------------------------------- #
+# Blocker 2 -- labels: log-space correction, dense support, sinks EXCLUDED
+# --------------------------------------------------------------------------- #
+def test_pmi_recovers_question_specific_token():
+    imps = _sink_importances(question_imgs=(2, 5))
+    base = make_baseline(imps)
+    assert imps[0].argmax().item() == SINK_IMG          # before: sink dominates
+    s = pmi_scores(imps[0], base)
+    assert s.argmax().item() == 2                       # after: grounded token wins
+    assert s[2] > s[SINK_IMG]
+
+
+def test_pmi_support_is_dense_unlike_subtraction():
+    """The clamp in subtract_baseline kills entries; PMI keeps every token."""
+    imps = _sink_importances(question_imgs=(2, 5))
+    base = make_baseline(imps)
+    sub = subtract_baseline(imps[0], base)
+    lab = teacher_label(imps[0], base)
+    assert (sub == 0).any()                             # subtraction zeroes entries
+    assert torch.isfinite(lab.scores).all()
+    assert (lab.distribution() > 0).all()               # every candidate gets mass
+
+
+def test_teacher_label_excludes_sink_from_candidates_not_by_zeroing():
+    imps = _sink_importances(question_imgs=(2, 5))
+    base = make_baseline(imps)
+    lab = teacher_label(imps[0], base, drop_sink_k=1)
+    assert isinstance(lab, TeacherLabel)
+    assert not lab.cand_mask[SINK_IMG]                  # removed from the set ...
+    assert lab.n_cand == L_V - 1
+    assert SINK_IMG not in lab.cand_idx.tolist()
+    assert lab.scores[SINK_IMG].isfinite()              # ... not zeroed in the label
+
+
+def test_teacher_distribution_is_over_candidates_and_normalised():
+    imps = _sink_importances(question_imgs=(2, 5))
+    lab = teacher_label(imps[0], make_baseline(imps), drop_sink_k=1)
+    p = lab.distribution()
+    assert p.shape == (lab.n_cand,)
+    assert abs(p.sum().item() - 1.0) < 1e-5
+    assert p.argmax().item() == lab.cand_idx.tolist().index(2)
+
+
+def test_temperature_flattens_without_reordering():
+    imps = _sink_importances(question_imgs=(2, 5))
+    lab = teacher_label(imps[0], make_baseline(imps))
+    sharp, flat = lab.distribution(0.5), lab.distribution(2.0)
+    assert sharp.max() > flat.max()                                  # flatter
+    assert torch.equal(sharp.argsort(), flat.argsort())              # same ranking
+
+
+def test_scores_are_independent_of_candidate_choice():
+    """FRM spec: store RAW scores so a sink-k / fovea sweep never regenerates labels."""
+    imps = _sink_importances(question_imgs=(2, 5))
+    base = make_baseline(imps)
+    a = teacher_label(imps[0], base, drop_sink_k=0)
+    b = teacher_label(imps[0], base, drop_sink_k=3)
+    assert torch.equal(a.scores, b.scores)
+    assert a.n_cand == L_V and b.n_cand == L_V - 3
+
+
+def test_candidate_mask_combines_exclusions():
+    fovea = torch.zeros(L_V, dtype=torch.bool); fovea[[0, 1]] = True
+    sinks = torch.zeros(L_V, dtype=torch.bool); sinks[[1, 7]] = True
+    cand = candidate_mask(L_V, exclude=[fovea, sinks])
+    assert cand.tolist() == [False, False, True, True, True, True, True, False]
+
+
+def test_candidate_mask_rejects_empty_set():
+    with pytest.raises(ValueError):
+        candidate_mask(L_V, exclude=[torch.ones(L_V, dtype=torch.bool)])
+
+
+def test_pmi_shape_mismatch_raises():
+    with pytest.raises(ValueError):
+        pmi_scores(torch.rand(L_V), torch.rand(L_V + 1))

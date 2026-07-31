@@ -24,13 +24,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from visual_selection import (  # noqa: E402
     TeacherLabel,
     VisualResult,
+    aggregate_sink_scores,
     candidate_mask,
+    detect_sinks,
     image_importance,
     make_baseline,
     make_baseline_loo,
     pmi_scores,
     select_debiased,
     select_important_image_tokens,
+    sink_report,
+    sink_scores,
     sink_token_mask,
     subtract_baseline,
     teacher_label,
@@ -343,3 +347,135 @@ def test_candidate_mask_rejects_empty_set():
 def test_pmi_shape_mismatch_raises():
     with pytest.raises(ValueError):
         pmi_scores(torch.rand(L_V), torch.rand(L_V + 1))
+
+
+# --------------------------------------------------------------------------- #
+# Attention-sink detection from a full-sequence attention tensor
+#
+# Synthetic "VLM": L = L_V image tokens followed by L_T text tokens. One image
+# token is a SINK (every query attends to it); one is CONTENT (only two queries
+# attend to it, but very strongly, so its MEAN is comparable to the sink's --
+# which is exactly the case a mean-based detector cannot separate).
+# --------------------------------------------------------------------------- #
+SINK_TOK, CONTENT_TOK = 3, 6
+
+
+def _vlm_attention(n_layers=4, heads=H, seed=0, sink=SINK_TOK, content=CONTENT_TOK):
+    """Sink gets a MODERATE boost from every query (+3). Content gets a LARGER
+    boost (+5) but only from 3 of the 5 text queries. The sizes are chosen so the
+    content token wins on MEAN incoming attention while the sink wins on the
+    low-quantile FLOOR -- the case that separates the two detectors."""
+    g = torch.Generator().manual_seed(seed)
+    L = L_V + L_T
+    img = torch.zeros(L, dtype=torch.bool); img[:L_V] = True
+    txt = torch.zeros(L, dtype=torch.bool); txt[L_V:] = True
+
+    attn = {}
+    for l in range(n_layers):
+        S = torch.randn(heads, L, L, generator=g) * 0.3
+        S[:, :, sink] += 3.0                              # every query -> the sink
+        for r in range(L_V, L_V + 3):                     # 3 of 5 text queries only
+            S[:, r, content] += 5.0
+        attn[l] = S
+    return attn, img, txt
+
+
+def test_sink_scores_flag_the_sink_not_the_content_token():
+    attn, img, txt = _vlm_attention()
+    s = sink_scores(attn, img, txt)
+    assert s.shape == (L_V,)
+    assert int(s.argmax()) == SINK_TOK
+    assert s[SINK_TOK] > s[CONTENT_TOK]
+
+
+def test_mean_attention_would_be_fooled_where_the_quantile_is_not():
+    """The content token is designed so its MEAN incoming attention rivals the
+    sink's. Only the low-quantile floor separates them -- this is the whole reason
+    sink_scores uses a quantile."""
+    attn, img, txt = _vlm_attention()
+    tpos, vpos = torch.nonzero(txt).squeeze(-1), torch.nonzero(img).squeeze(-1)
+    A = torch.softmax(attn[0].float(), dim=-1)[:, tpos][:, :, vpos]
+    mean_score = A.mean(dim=1).mean(dim=0)
+    q_score = sink_scores({0: attn[0]}, img, txt)
+    assert mean_score[CONTENT_TOK] > mean_score[SINK_TOK]      # mean is fooled
+    assert q_score[SINK_TOK] > q_score[CONTENT_TOK]            # the floor is not
+
+
+def test_detect_sinks_finds_the_planted_sink_and_not_the_content_token():
+    attn, img, txt = _vlm_attention()
+    m = detect_sinks(sink_scores(attn, img, txt))
+    assert m[SINK_TOK] and not m[CONTENT_TOK]
+    assert 1 <= int(m.sum()) <= 2
+
+
+def test_detect_sinks_returns_nothing_when_there_is_no_sink():
+    g = torch.Generator().manual_seed(3)
+    assert detect_sinks(torch.rand(L_V, generator=g) * 1e-3 + 0.5).sum() == 0
+    assert detect_sinks(torch.full((L_V,), 0.25)).sum() == 0     # constant -> MAD 0
+
+
+def test_detect_sinks_k_overrides_the_outlier_rule():
+    attn, img, txt = _vlm_attention()
+    s = sink_scores(attn, img, txt)
+    assert int(detect_sinks(s, k=3).sum()) == 3
+    assert int(detect_sinks(s, k=0).sum()) == 0
+
+
+def test_detect_sinks_respects_max_frac():
+    s = torch.arange(L_V, dtype=torch.float32) ** 4      # many extreme outliers
+    assert int(detect_sinks(s, max_frac=0.25).sum()) <= int(0.25 * L_V)
+
+
+def test_sink_scores_post_softmax_matches_raw():
+    attn, img, txt = _vlm_attention()
+    post = {l: torch.softmax(a.float(), dim=-1) for l, a in attn.items()}
+    assert torch.allclose(sink_scores(attn, img, txt),
+                          sink_scores(post, img, txt, is_post_softmax=True), atol=1e-6)
+
+
+def test_aggregate_sink_scores_is_steadier_across_examples():
+    scores = []
+    for s in range(4):
+        attn, img, txt = _vlm_attention(seed=s)
+        scores.append(sink_scores(attn, img, txt))
+    agg = aggregate_sink_scores(scores)
+    assert agg.shape == (L_V,)
+    assert int(agg.argmax()) == SINK_TOK
+    assert detect_sinks(agg)[SINK_TOK]
+
+
+def test_sink_report_is_readable():
+    attn, img, txt = _vlm_attention()
+    s = sink_scores(attn, img, txt)
+    txt_out = sink_report(s, detect_sinks(s))
+    assert "sinks" in txt_out and f"token {SINK_TOK}" in txt_out
+
+
+# --------------------------------------------------------------------------- #
+# Removing the sink BEFORE the softmax
+# --------------------------------------------------------------------------- #
+def test_cand_mask_zeroes_excluded_and_renormalises():
+    maps = _maps_with_sink(2, 0)
+    cand = candidate_mask(L_V, exclude=[sink_token_mask(
+        image_importance(maps, _rater_mask())[0], 1)])
+    imp, _, _, _ = image_importance(maps, _rater_mask(), cand_mask=cand)
+    assert float(imp[SINK_IMG]) == 0.0
+    assert abs(float(imp.sum()) - 1.0) < 1e-5
+    assert int(imp.argmax()) == 2                     # grounded token now wins
+
+
+def test_excluding_before_softmax_beats_subtracting_after():
+    """Post-hoc subtraction cannot undo the mass the sink already stole from every
+    other patch; excluding it pre-softmax gives the real patch strictly more."""
+    maps = _maps_with_sink(2, 0)
+    rm = _rater_mask()
+    plain, *_ = image_importance(maps, rm)
+    cand = candidate_mask(L_V, exclude=[sink_token_mask(plain, 1)])
+    excluded, *_ = image_importance(maps, rm, cand_mask=cand)
+    assert excluded[2] > plain[2]
+
+
+def test_cand_mask_excluding_everything_raises():
+    with pytest.raises(ValueError):
+        image_importance(_synthetic_maps(), _rater_mask(),
+                         cand_mask=torch.zeros(L_V, dtype=torch.bool))

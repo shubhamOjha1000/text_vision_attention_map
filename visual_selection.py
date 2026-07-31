@@ -72,11 +72,18 @@ def _threshold(importance: torch.Tensor, pct: float) -> torch.Tensor:
 def image_importance(maps_per_head: Dict[int, torch.Tensor],
                      rater_mask: torch.Tensor, *,
                      band: Optional[Sequence[int]] = None,
-                     assert_finite: bool = True):
+                     assert_finite: bool = True,
+                     cand_mask: Optional[torch.Tensor] = None):
     """
     The per-image-token importance distribution (steps 0-4; NO threshold).
     Returns (importance[L_v], per_layer[n_layers, L_v], band_list, n_raters).
     Use this to score several (image, question) contexts and then de-bias them.
+
+    `cand_mask` (bool [L_v]) excludes image tokens BEFORE the softmax -- pass the
+    complement of `detect_sinks(...)` to stop attention sinks from stealing
+    softmax mass from real patches. Excluded tokens come back as exactly 0.
+    Removing a sink here is strictly better than subtracting it afterwards: after
+    the softmax the damage (every other patch scaled down) is already done.
     """
     layers = sorted(maps_per_head.keys())
     if band is None:
@@ -92,11 +99,18 @@ def image_importance(maps_per_head: Dict[int, torch.Tensor],
     if n_raters == 0:
         raise ValueError("rater_mask selects no text tokens")
 
+    if cand_mask is not None:
+        cand_mask = cand_mask.bool()
+        if int(cand_mask.sum()) == 0:
+            raise ValueError("cand_mask excludes every image token")
+
     per_layer = []
     for l in band:
         P = maps_per_head[l][:, rater_idx, :].float()    # [H, n_raters, L_v]
         if assert_finite and not torch.isfinite(P).all():
             P = torch.where(torch.isfinite(P), P, torch.full_like(P, float("-inf")))
+        if cand_mask is not None:                        # drop sinks BEFORE the softmax
+            P = P.masked_fill(~cand_mask.view(1, 1, -1), float("-inf"))
         Ptil = F.softmax(P, dim=-1)                      # softmax over IMAGE, rows sum to 1
         s = Ptil.mean(dim=1).mean(dim=0)                 # mean over raters, then heads -> [L_v]
         s = s / s.sum().clamp_min(1e-12)
@@ -119,6 +133,120 @@ def image_importance(maps_per_head: Dict[int, torch.Tensor],
 #     NOTHING to `KL(p || r) = sum_i p_i log(p_i / r_i)`, so the student is never
 #     penalised for putting mass there -- the sinks become free real estate.
 # --------------------------------------------------------------------------- #
+def sink_scores(attn_full: Dict[int, torch.Tensor],
+                image_mask: torch.Tensor,
+                text_mask: torch.Tensor, *,
+                is_post_softmax: bool = False,
+                quantile: float = 0.1,
+                band: Optional[Sequence[int]] = None) -> torch.Tensor:
+    """
+    Per-image-token ATTENTION-SINK score [L_v], from ONE forward pass. Model-agnostic.
+
+    Definition used
+    ---------------
+    A sink is a token that **every** query attends to. A content patch is attended
+    to strongly by a *few* queries and ignored by the rest; a sink has a high
+    FLOOR of incoming attention across all of them. So we score each image token by
+    the low `quantile` of the attention it receives, not the mean -- the mean cannot
+    separate "one patch everybody needs" from "one patch a few queries need a lot".
+
+        score[j] = mean over (layer, head) of
+                       quantile_over_text_queries( A[text_row, j] )
+
+    Queries are restricted to TEXT rows, which sit after the image in the sequence
+    and can therefore attend to every image token -- so causal masking never makes a
+    token look sink-free just because it came late.
+
+    Parameters
+    ----------
+    attn_full : {layer: [H, L, L]} attention over the FULL sequence (not the
+        text->vision slice). Pass `ProbeOutput.raw_scores` (pre-softmax; softmaxed
+        here over the full key axis) or `ProbeOutput.post_softmax` with
+        `is_post_softmax=True`.
+    image_mask, text_mask : bool [L] over the full sequence.
+
+    Note: raw scores must already have the attention mask added (the HF eager
+    probes do this). For a prefill pass with full visibility it makes no difference.
+    """
+    if not attn_full:
+        raise ValueError("attn_full is empty")
+    layers = sorted(attn_full)
+    band = layers if band is None else [l for l in band if l in attn_full]
+    if not band:
+        raise ValueError(f"no requested band layer present (have {layers})")
+
+    tpos = torch.nonzero(text_mask.bool(), as_tuple=False).squeeze(-1)
+    vpos = torch.nonzero(image_mask.bool(), as_tuple=False).squeeze(-1)
+    if tpos.numel() == 0 or vpos.numel() == 0:
+        raise ValueError("need at least one text row and one image column")
+
+    acc = torch.zeros(vpos.numel(), dtype=torch.float32)
+    for l in band:
+        A = attn_full[l].float()                       # [H, L, L]
+        if not is_post_softmax:
+            A = F.softmax(A, dim=-1)                   # true attention weights
+        A = A[:, tpos][:, :, vpos]                     # [H, L_t, L_v]
+        acc += torch.quantile(A, quantile, dim=1).mean(dim=0)   # floor, then heads
+    return acc / len(band)
+
+
+def aggregate_sink_scores(scores: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Mean sink score over several examples. Sinks are a property of the MODEL, so
+    averaging a handful of (image, question) pairs gives a much steadier estimate --
+    and lets you freeze the resulting mask and reuse it forever."""
+    return torch.stack([s.float() for s in scores], dim=0).mean(dim=0)
+
+
+def detect_sinks(score: torch.Tensor, *,
+                 k: Optional[int] = None,
+                 z: float = 3.5,
+                 max_frac: float = 0.15) -> torch.Tensor:
+    """
+    bool [L_v]: True where `score` marks an attention sink.
+
+    With `k` -> simply the top-k. Otherwise a robust outlier rule (median + MAD),
+    which adapts: it returns nothing when the model has no sink and several when it
+    has several, instead of always removing a fixed count. `max_frac` caps how much
+    of the grid can ever be called a sink.
+    """
+    score = score.float()
+    L_v = score.numel()
+    if k is not None:
+        m = torch.zeros(L_v, dtype=torch.bool)
+        if k > 0:
+            m[torch.topk(score, min(k, L_v)).indices] = True
+        return m
+
+    med = score.median()
+    mad = (score - med).abs().median()
+    if float(mad) <= 0:                                  # degenerate / constant
+        return torch.zeros(L_v, dtype=torch.bool)
+    mz = 0.6745 * (score - med) / mad                    # modified z-score
+    m = mz > z
+
+    cap = int(max_frac * L_v)
+    if int(m.sum()) > cap:                               # keep only the worst `cap`
+        m = torch.zeros(L_v, dtype=torch.bool)
+        m[torch.topk(score, max(cap, 1)).indices] = True
+    return m
+
+
+def sink_report(score: torch.Tensor, mask: torch.Tensor, grid: Optional[int] = None) -> str:
+    """One-line-per-sink human summary, with (row, col) if the grid is square."""
+    idx = torch.nonzero(mask, as_tuple=False).squeeze(-1).tolist()
+    L_v = score.numel()
+    if grid is None:
+        g = int(round(L_v ** 0.5))
+        grid = g if g * g == L_v else None
+    med = float(score.median())
+    lines = [f"{len(idx)}/{L_v} tokens flagged as sinks (median score {med:.2e})"]
+    for i in sorted(idx, key=lambda j: -float(score[j])):
+        where = f" (row {i // grid}, col {i % grid})" if grid else ""
+        lines.append(f"   token {i}{where}  score {float(score[i]):.2e}  "
+                     f"= {float(score[i]) / max(med, 1e-12):.0f}x median")
+    return "\n".join(lines)
+
+
 def make_baseline(importances: Sequence[torch.Tensor]) -> torch.Tensor:
     """
     Position-bias baseline [L_v] = mean of several importance maps (from different

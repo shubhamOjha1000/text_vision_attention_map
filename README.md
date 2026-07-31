@@ -1,15 +1,28 @@
 # text_vision_attention_map
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/shubhamOjha1000/text_vision_attention_map/blob/main/colab_test_paligemma.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/shubhamOjha1000/text_vision_attention_map/blob/main/colab_verify_label_fixes.ipynb)
 
 Extract the **text → vision attention map** from PaliGemma — the same decoder
 self-attention that SparseVLM uses to build its priority matrix `P` — with
 **text tokens in the rows and visual tokens in the columns**.
 
-**Quick start:** click the *Open in Colab* badge above — it clones this repo,
-loads PaliGemma from the Hub, and runs the full correctness suite on the real
-model, proving the captured maps are the genuine **raw pre-softmax** text→vision
-scores (rows = text, columns = vision).
+**Quick start:** click the *Open in Colab* badge above — it clones this repo and
+runs the full `pytest` suite on a **CPU** runtime (no weights, no GPU, ~1 min),
+covering the raw-attention invariants, rater selection, image-token sampling and
+sink detection. The correctness proof that the captured maps are the genuine
+**raw pre-softmax** text→vision scores lives in `tests/test_raw_attention.py`,
+which runs against a synthetic VLM always and against real models
+(PaliGemma / SmolVLM2 / Qwen2.5-VL) whenever weights and auth are available.
+
+### Analysis notebooks (GPU)
+
+| notebook | purpose |
+|---|---|
+| `colab_find_sink_any_vlm.ipynb` | detect the attention sink in any VLM, exclude it, recompute the distribution |
+| `colab_faithfulness_loo.ipynb` | leave-one-out ground truth: ablate each patch, measure the drop in answer logprob |
+| `colab_precision_at_k.ipynb` | score every candidate label against that ground truth, with controls |
+| `colab_checks_123.ipynb` | de-contaminate the referee, test the far-context premise, sweep layer bands |
+| `colab_wearvqa_gaze_eval.ipynb` | gaze-grounded eval on WEAR-VQA |
 
 This folder is **not** about sparsification. No raters, no pruning. **Every text
 token is kept in the rows.** We only read the attention map out and hand it back.

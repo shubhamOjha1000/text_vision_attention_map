@@ -51,17 +51,23 @@ class VisualResult:
         self.n_kept = int(self.vision_mask.sum())
 
 
-def select_important_image_tokens(
-    maps_per_head: Dict[int, torch.Tensor],   # {layer: [H, L_t, L_v]} RAW scores
-    rater_mask: torch.Tensor,                  # bool [L_t]  which text rows are raters
-    *,
-    band: Optional[Sequence[int]] = None,      # layers to use; default = ALL captured layers
-    pct: float = 0.5,                          # fraction of image tokens to DROP
-    assert_finite: bool = True,
-) -> VisualResult:
+def _threshold(importance: torch.Tensor, pct: float) -> torch.Tensor:
+    """Top-k mask: keep the L_v - floor(pct*L_v) highest-importance image tokens."""
+    L_v = importance.numel()
+    n_keep = max(1, L_v - int(pct * L_v))
+    mask = torch.zeros(L_v, dtype=torch.bool)
+    mask[torch.topk(importance, n_keep).indices] = True
+    return mask
+
+
+def image_importance(maps_per_head: Dict[int, torch.Tensor],
+                     rater_mask: torch.Tensor, *,
+                     band: Optional[Sequence[int]] = None,
+                     assert_finite: bool = True):
     """
-    Score image tokens using only the rater text rows' attention, aggregated over
-    all (or `band`) decoder layers, and keep the top `L_v - floor(pct * L_v)`.
+    The per-image-token importance distribution (steps 0-4; NO threshold).
+    Returns (importance[L_v], per_layer[n_layers, L_v], band_list, n_raters).
+    Use this to score several (image, question) contexts and then de-bias them.
     """
     layers = sorted(maps_per_head.keys())
     if band is None:
@@ -77,34 +83,97 @@ def select_important_image_tokens(
     if n_raters == 0:
         raise ValueError("rater_mask selects no text tokens")
 
-    L_v = maps_per_head[band[0]].shape[-1]
-
     per_layer = []
     for l in band:
         P = maps_per_head[l][:, rater_idx, :].float()    # [H, n_raters, L_v]
         if assert_finite and not torch.isfinite(P).all():
             P = torch.where(torch.isfinite(P), P, torch.full_like(P, float("-inf")))
-        # Step 2: softmax DOWN the image axis (dim=-1), per (head, text row)
-        Ptil = F.softmax(P, dim=-1)                      # [H, n_raters, L_v], rows sum to 1
-        # Step 3: mean over rater rows, then over heads -> per-image scores; normalise
-        s = Ptil.mean(dim=1).mean(dim=0)                 # [L_v]
-        s = s / s.sum().clamp_min(1e-12)                 # distribution over image tokens
+        Ptil = F.softmax(P, dim=-1)                      # softmax over IMAGE, rows sum to 1
+        s = Ptil.mean(dim=1).mean(dim=0)                 # mean over raters, then heads -> [L_v]
+        s = s / s.sum().clamp_min(1e-12)
         per_layer.append(s)
     per_layer = torch.stack(per_layer, dim=0)            # [n_layers, L_v]
 
-    # Step 4: sum over all L layers, normalise -> final image-token distribution
-    final = per_layer.sum(dim=0)
+    final = per_layer.sum(dim=0)                         # sum over ALL layers
     final = final / final.sum().clamp_min(1e-12)         # [L_v]
+    return final, per_layer, list(band), n_raters
 
-    # Step 5: top-k threshold -> keep the important image tokens
-    n_drop = int(pct * L_v)
-    n_keep = max(1, L_v - n_drop)
-    vision_mask = torch.zeros(L_v, dtype=torch.bool)
-    vision_mask[torch.topk(final, n_keep).indices] = True
 
-    return VisualResult(vision_mask=vision_mask, importance=final,
+# --------------------------------------------------------------------------- #
+# Sink-token removal:  B (baseline subtraction)  +  A (drop invariant sinks)
+# --------------------------------------------------------------------------- #
+def make_baseline(importances: Sequence[torch.Tensor]) -> torch.Tensor:
+    """
+    Position-bias baseline [L_v] = mean of several importance maps (from different
+    questions / a null prompt). The question-INVARIANT part -- i.e. the sinks --
+    survives the mean; question-specific grounding averages out.
+    """
+    return torch.stack([i.float() for i in importances], dim=0).mean(dim=0)
+
+
+def subtract_baseline(importance: torch.Tensor, baseline: torch.Tensor,
+                      *, renorm: bool = True) -> torch.Tensor:
+    """B: remove the sink/position bias -> importance - baseline (clamped >= 0)."""
+    deb = (importance - baseline).clamp_min(0.0)
+    if renorm:
+        s = deb.sum()
+        if s > 0:
+            deb = deb / s
+    return deb
+
+
+def sink_token_mask(baseline: torch.Tensor, k: int) -> torch.Tensor:
+    """A: bool[L_v] marking the k highest-baseline image tokens (the sinks)."""
+    m = torch.zeros(baseline.numel(), dtype=torch.bool)
+    if k > 0:
+        m[torch.topk(baseline, min(k, baseline.numel())).indices] = True
+    return m
+
+
+def select_debiased(maps_per_head: Dict[int, torch.Tensor],
+                    rater_mask: torch.Tensor, *,
+                    baseline: torch.Tensor,
+                    drop_sink_k: int = 0,
+                    pct: float = 0.5,
+                    band: Optional[Sequence[int]] = None) -> VisualResult:
+    """
+    Sink-robust selection: subtract the position-bias `baseline` (B), optionally
+    zero the top `drop_sink_k` baseline patches (A), then keep the top-k.
+    Build `baseline` with `make_baseline([...])` from a few questions / a null prompt.
+    (`per_layer` in the result is the PRE-baseline per-layer distribution.)
+    """
+    importance, per_layer, band, n_raters = image_importance(
+        maps_per_head, rater_mask, band=band)
+    importance = subtract_baseline(importance, baseline)
+    if drop_sink_k > 0:
+        importance = importance.clone()
+        importance[sink_token_mask(baseline, drop_sink_k)] = 0.0
+        s = importance.sum()
+        if s > 0:
+            importance = importance / s
+    vision_mask = _threshold(importance, pct)
+    return VisualResult(vision_mask=vision_mask, importance=importance,
                         per_layer=per_layer, band=list(band), pct=pct,
                         n_raters=n_raters)
+
+
+def select_important_image_tokens(
+    maps_per_head: Dict[int, torch.Tensor],   # {layer: [H, L_t, L_v]} RAW scores
+    rater_mask: torch.Tensor,                  # bool [L_t]  which text rows are raters
+    *,
+    band: Optional[Sequence[int]] = None,      # layers to use; default = ALL captured layers
+    pct: float = 0.5,                          # fraction of image tokens to DROP
+    assert_finite: bool = True,
+) -> VisualResult:
+    """
+    Score image tokens using only the rater text rows' attention, aggregated over
+    all (or `band`) decoder layers, and keep the top `L_v - floor(pct * L_v)`.
+    """
+    importance, per_layer, band, n_raters = image_importance(
+        maps_per_head, rater_mask, band=band, assert_finite=assert_finite)
+    vision_mask = _threshold(importance, pct)
+    return VisualResult(vision_mask=vision_mask, importance=importance,
+                        per_layer=per_layer, band=band, pct=pct, n_raters=n_raters)
 
 
 def select_from_rater(maps_per_head: Dict[int, torch.Tensor], rater_result, *,

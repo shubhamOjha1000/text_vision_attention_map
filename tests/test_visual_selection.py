@@ -426,6 +426,47 @@ def test_detect_sinks_respects_max_frac():
     assert int(detect_sinks(s, max_frac=0.25).sum()) <= int(0.25 * L_V)
 
 
+def _vlm_attention_with_leading_text(n_pre=2, n_layers=4, heads=H, seed=0):
+    """Realistic chat-template layout: [text BEFORE image] [image] [text AFTER].
+
+    Regression case. Under causal masking the leading text rows have exactly zero
+    attention to every image token. Including them made `quantile=0.1` read out of
+    that blind zone and return an all-zero score vector -- which is what the real
+    SmolVLM2 run produced (median score 0.0, nothing detected).
+    """
+    g = torch.Generator().manual_seed(seed)
+    L = n_pre + L_V + L_T
+    img = torch.zeros(L, dtype=torch.bool); img[n_pre:n_pre + L_V] = True
+    txt = torch.ones(L, dtype=torch.bool);  txt[n_pre:n_pre + L_V] = False
+    sink, content = n_pre + SINK_TOK, n_pre + CONTENT_TOK
+
+    attn = {}
+    for l in range(n_layers):
+        S = torch.randn(heads, L, L, generator=g) * 0.3
+        S[:, :, sink] += 3.0
+        for r in range(n_pre + L_V, n_pre + L_V + 3):
+            S[:, r, content] += 5.0
+        S[:, :n_pre, n_pre:n_pre + L_V] = -1e9        # causally blind to the image
+        attn[l] = S
+    return attn, img, txt
+
+
+def test_sink_scores_ignores_rows_that_cannot_see_the_image():
+    attn, img, txt = _vlm_attention_with_leading_text()
+    s = sink_scores(attn, img, txt)
+    assert float(s.median()) > 0, "all-zero score vector: blind rows poisoned the quantile"
+    assert int(s.argmax()) == SINK_TOK
+    assert detect_sinks(s)[SINK_TOK]
+
+
+def test_sink_scores_raises_when_no_row_sees_the_image():
+    attn, img, txt = _vlm_attention_with_leading_text()
+    for a in attn.values():                            # blind out EVERY text row
+        a[:, :, img] = -1e9
+    with pytest.raises(ValueError, match="no text query row"):
+        sink_scores(attn, img, txt)
+
+
 def test_sink_scores_post_softmax_matches_raw():
     attn, img, txt = _vlm_attention()
     post = {l: torch.softmax(a.float(), dim=-1) for l, a in attn.items()}

@@ -138,7 +138,8 @@ def sink_scores(attn_full: Dict[int, torch.Tensor],
                 text_mask: torch.Tensor, *,
                 is_post_softmax: bool = False,
                 quantile: float = 0.1,
-                band: Optional[Sequence[int]] = None) -> torch.Tensor:
+                band: Optional[Sequence[int]] = None,
+                min_mass: float = 1e-6) -> torch.Tensor:
     """
     Per-image-token ATTENTION-SINK score [L_v], from ONE forward pass. Model-agnostic.
 
@@ -153,9 +154,13 @@ def sink_scores(attn_full: Dict[int, torch.Tensor],
         score[j] = mean over (layer, head) of
                        quantile_over_text_queries( A[text_row, j] )
 
-    Queries are restricted to TEXT rows, which sit after the image in the sequence
-    and can therefore attend to every image token -- so causal masking never makes a
-    token look sink-free just because it came late.
+    Queries are restricted to text rows that can actually SEE the image. Chat
+    templates put text on BOTH sides of the image block ("<|im_start|>User:" before
+    it, the question after), and under causal masking the leading rows have exactly
+    zero attention to every image token. Including them poisons a low quantile: with
+    ~15% blind rows, `quantile=0.1` reads out of the blind zone and returns 0 for
+    every patch. Rows whose attention mass over image columns is <= `min_mass` are
+    therefore dropped before the quantile is taken.
 
     Parameters
     ----------
@@ -181,12 +186,23 @@ def sink_scores(attn_full: Dict[int, torch.Tensor],
         raise ValueError("need at least one text row and one image column")
 
     acc = torch.zeros(vpos.numel(), dtype=torch.float32)
+    n_seen = 0
     for l in band:
         A = attn_full[l].float()                       # [H, L, L]
         if not is_post_softmax:
             A = F.softmax(A, dim=-1)                   # true attention weights
         A = A[:, tpos][:, :, vpos]                     # [H, L_t, L_v]
-        acc += torch.quantile(A, quantile, dim=1).mean(dim=0)   # floor, then heads
+
+        # drop query rows that are causally blind to the image (text before the
+        # image block); their row is all-zero and would drag the quantile to 0
+        seen = A.sum(dim=-1).mean(dim=0) > min_mass    # [L_t]
+        if not bool(seen.any()):
+            continue
+        n_seen = max(n_seen, int(seen.sum()))
+        acc += torch.quantile(A[:, seen, :], quantile, dim=1).mean(dim=0)
+    if n_seen == 0:
+        raise ValueError(
+            "no text query row attends to the image -- check the image/text masks")
     return acc / len(band)
 
 
